@@ -161,17 +161,48 @@ test('subscriber.subscribe() emits SUBSCRIBE and registers the exact CONSUME-* l
     assert.strictEqual(receivedFrom, 'order-service');
 });
 
-// NOTE: subscribeAll() / the no-event-name "subscribe to everything from a
-// producer" path is NOT covered here. lib/subscriber.js line 12 does
-// `const { constants } = require('buffer')`, which shadows the file's own
-// `Constants` (tyo-mq-protocol's, imported capitalised on line 8) for the
-// one lowercase use at line 101 (`eventStr = constants.EVENT_ALL`). That
-// resolves to Node's buffer.constants.EVENT_ALL, which is undefined, so
-// eventStr comes out undefined and events.toConsumerEvent() throws "Unknown
-// event object" — i.e. subscribeAll()/subscribe(who, cb) is currently
-// broken for every caller. This was discovered while writing this suite;
-// it is a real lib/subscriber.js bug, not a test issue, and is out of scope
-// for this test-only task — flagged in the task report instead of silently
-// fixed or silently swept under an incorrect passing assertion.
+// Regression test for the fixed buffer.constants shadowing bug. Previously
+// lib/subscriber.js did `const { constants } = require('buffer')`, which
+// shadowed the file's own capitalised `Constants` (tyo-mq-protocol's) for
+// the lone lowercase use `eventStr = constants.EVENT_ALL` on the no-event
+// path — resolving to Node's buffer.constants.EVENT_ALL (undefined) and
+// making events.toConsumerEvent() throw "Unknown event object". The
+// two-arg subscribe(who, callback) form (subscribe to *everything* from a
+// producer) is exactly the caller that takes that path, so it exercises the
+// previously-broken line end to end.
+test('subscriber.subscribe(who, callback) with no event name uses EVENT_ALL/ALL scope (regression: buffer.constants shadowing)', () => {
+    const factory = new Factory({ logger: quietLogger });
+    let consumer;
+    factory.createConsumer('sub-all-test', function (c) { consumer = c; });
+    lastSocket()._simulateConnect();
+    const socket = lastSocket();
+
+    let received = null;
+    let receivedFrom = null;
+    // No event name -> subscribe to all events from 'order-service'. This is
+    // the path that threw "Unknown event object" before the fix.
+    consumer.subscribe('order-service', function (message, from) {
+        received = message;
+        receivedFrom = from;
+    });
+
+    // (a) the SUBSCRIBE frame carries tyo-mq-protocol's EVENT_ALL under the ALL scope
+    const subscribeCall = socket.emits.filter((e) => e.event === 'SUBSCRIBE').pop();
+    assert.ok(subscribeCall, 'expected a SUBSCRIBE emit');
+    assert.strictEqual(subscribeCall.payload.event, protocol.constants.EVENT_ALL);
+    assert.strictEqual(subscribeCall.payload.scope, protocol.constants.SCOPE_ALL);
+    assert.strictEqual(subscribeCall.payload.producer, 'order-service');
+
+    // (b) the consume listener is named exactly what tyo-mq-protocol derives
+    // for the EVENT_ALL/scope_all case, and inbound messages reach the handler.
+    const consumerEventStr = protocolEvents.toConsumerEvent(protocol.constants.EVENT_ALL, 'order-service', true);
+    const consumeEventStr = protocolEvents.toConsumeEvent(consumerEventStr);
+    assert.ok(socket.listeners(consumeEventStr).length > 0,
+        'expected a listener registered for ' + consumeEventStr);
+
+    socket._trigger(consumeEventStr, { message: { hi: 5 }, from: 'order-service' });
+    assert.deepStrictEqual(received, { hi: 5 });
+    assert.strictEqual(receivedFrom, 'order-service');
+});
 
 run();
