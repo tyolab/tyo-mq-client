@@ -13,7 +13,7 @@
   ],
   "dependencies": {
     "socket.io-client": "^4.5.2",
-    "tyo-mq-protocol": "file:../tyo-mq-protocol"
+    "tyo-mq-protocol": "^0.1.0"
   },
   "devDependencies": {
     "browserify": "^17.0.1"
