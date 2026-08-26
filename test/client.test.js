@@ -205,4 +205,105 @@ test('subscriber.subscribe(who, callback) with no event name uses EVENT_ALL/ALL 
     assert.strictEqual(receivedFrom, 'order-service');
 });
 
+// ---------------------------------------------------------------------------
+// 4. Sealed emit guards — _sealedEmit must never hang forever: it times out
+//    against a dead/never-acking broker and rejects immediately when the
+//    socket disconnects mid-wait, in both the Promise and callback styles.
+// ---------------------------------------------------------------------------
+
+function makeSealedConsumer(name) {
+    const factory = new Factory({ logger: quietLogger });
+    let consumer;
+    factory.createConsumer(name, function (c) { consumer = c; });
+    lastSocket()._simulateConnect();
+    return { consumer, socket: lastSocket() };
+}
+
+// Fails cleanly (instead of hanging npm test) when the promise under test
+// never settles — the exact bug these tests guard against.
+function within(promise, ms) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(
+            () => reject(new Error('promise did not settle within ' + ms + 'ms')), ms))
+    ]);
+}
+
+test('_sealedEmit: rejects within the (shortened) timeout when the broker never acks', async () => {
+    const originalTimeout = Subscriber.EMIT_ACK_TIMEOUT_MS;
+    Subscriber.EMIT_ACK_TIMEOUT_MS = 50;
+    try {
+        const { consumer } = makeSealedConsumer('sealed-timeout-test');
+        // Never ack the recorded emit — a dead broker.
+        await assert.rejects(
+            within(consumer.sendSealed('realm', 'bob', 'uak', 'blob', 'm1'), 1000),
+            /SEALED_DELIVER failed: .*timed out/);
+    } finally {
+        Subscriber.EMIT_ACK_TIMEOUT_MS = originalTimeout;
+    }
+});
+
+test('_sealedEmit: rejects promptly when the socket disconnects mid-wait (default 15s timeout NOT waited out)', async () => {
+    const { consumer, socket } = makeSealedConsumer('sealed-disconnect-test');
+    const pending = consumer.requestSenderCert('alice', 'identity-key-b64', 1);
+    socket.disconnect();
+    // Must settle in well under EMIT_ACK_TIMEOUT_MS (15s): 1s race window.
+    await assert.rejects(within(pending, 1000), /SEALED_CERT_REQUEST failed: .*disconnected/);
+});
+
+test('_sealedEmit: a normal ack still resolves, and {ok:false} still rejects with the broker message', async () => {
+    const { consumer, socket } = makeSealedConsumer('sealed-ack-test');
+
+    const okPending = consumer.setUak('alice', 'uak-b64');
+    socket.emits.find((e) => e.event === 'SEALED_UAK_SET').ack({ ok: true, mode: 'require-uak' });
+    const response = await within(okPending, 1000);
+    assert.strictEqual(response.ok, true);
+    assert.strictEqual(response.mode, 'require-uak');
+
+    const failPending = consumer.sendSealed('realm', 'bob', 'uak', 'blob', 'm2');
+    socket.emits.filter((e) => e.event === 'SEALED_DELIVER').pop().ack({ ok: false, message: 'uak mismatch' });
+    await assert.rejects(within(failPending, 1000), /uak mismatch/);
+});
+
+test('_sealedEmit: callback-style API receives timeout and disconnect errors too', async () => {
+    const originalTimeout = Subscriber.EMIT_ACK_TIMEOUT_MS;
+    Subscriber.EMIT_ACK_TIMEOUT_MS = 50;
+    try {
+        const { consumer, socket } = makeSealedConsumer('sealed-callback-test');
+
+        // (a) timeout reaches the err-first callback
+        const timeoutErr = await within(new Promise((resolve) => {
+            consumer.sendSealed('realm', 'bob', 'uak', 'blob', 'm3', (err) => resolve(err));
+        }), 1000);
+        assert.ok(timeoutErr instanceof Error, 'expected an Error on timeout');
+        assert.match(timeoutErr.message, /timed out/);
+
+        // (b) disconnect mid-wait reaches the err-first callback
+        let disconnectErr = null;
+        consumer.requestSenderCert('alice', 'identity-key-b64', 1, (err) => { disconnectErr = err; });
+        socket.disconnect();
+        assert.ok(disconnectErr instanceof Error, 'expected an Error on disconnect');
+        assert.match(disconnectErr.message, /disconnected/);
+    } finally {
+        Subscriber.EMIT_ACK_TIMEOUT_MS = originalTimeout;
+    }
+});
+
+test('sealedSubscribe: uses the larger EMIT_DRAIN_TIMEOUT_MS (ack-mode drains legitimately outlast 15s) and still resolves on ack', async () => {
+    const { consumer, socket } = makeSealedConsumer('sealed-drain-timeout-test');
+
+    const pending = consumer.sealedSubscribe('alice');
+    const call = socket.emits.find((e) => e.event === 'SEALED_SUBSCRIBE');
+    assert.ok(call, 'expected a SEALED_SUBSCRIBE emit');
+    assert.strictEqual(call.payload.identity, 'alice');
+    assert.strictEqual(call.payload.ack, true);
+    assert.strictEqual(call.timeoutMs, Subscriber.EMIT_DRAIN_TIMEOUT_MS,
+        'sealedSubscribe must use the drain timeout, not EMIT_ACK_TIMEOUT_MS');
+    assert.ok(Subscriber.EMIT_DRAIN_TIMEOUT_MS > Subscriber.EMIT_ACK_TIMEOUT_MS);
+
+    call.ack({ ok: true, replayed: 0, dead: 0, pending: 0, more: false });
+    const response = await within(pending, 1000);
+    assert.strictEqual(response.ok, true);
+});
+
 run();

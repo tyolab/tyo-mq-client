@@ -75,6 +75,40 @@ FakeSocket.prototype.emit = function (event, payload, ack) {
     return this;
 };
 
+// socket.io-client >= 4.4's `socket.timeout(ms).emit(ev, payload, cb)`: cb is
+// invoked `(err)` when no ack arrives within ms, `(null, response)` when the
+// server acks — note the different callback shape from plain emit. The
+// recorded emit keeps the plain server-side ack shape `ack(response)` so
+// tests drive it exactly like a broker answering, and records `timeoutMs`
+// for assertions. Deliberately does NOT replicate real socket.io's
+// _clearAcks-on-disconnect behaviour, so the client's own disconnect guard
+// (not socket.io's) is what disconnect tests exercise.
+FakeSocket.prototype.timeout = function (ms) {
+    var self = this;
+    return {
+        emit: function (event, payload, cb) {
+            var settled = false;
+            var timer = setTimeout(function () {
+                if (settled) return;
+                settled = true;
+                cb(new Error('operation has timed out'));
+            }, ms);
+            self.emits.push({
+                event: event,
+                payload: payload,
+                timeoutMs: ms,
+                ack: function (response) {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
+                    cb(null, response);
+                }
+            });
+            return self;
+        }
+    };
+};
+
 FakeSocket.prototype.flush = function () {};
 
 FakeSocket.prototype.disconnect = function () {
