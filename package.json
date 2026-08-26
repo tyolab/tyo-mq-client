@@ -1,6 +1,6 @@
 {
   "name": "tyo-mq-client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "The tyo-mq pub/sub client (Node + browser). Building an app? This is the package you want — Apache-2.0, no AGPL.",
   "license": "Apache-2.0",
   "main": "index.js",
