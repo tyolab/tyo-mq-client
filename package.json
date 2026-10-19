@@ -1,9 +1,12 @@
 {
   "name": "tyo-mq-client",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "The tyo-mq pub/sub client (Node + browser). Building an app? This is the package you want — Apache-2.0, no AGPL.",
   "license": "Apache-2.0",
   "main": "index.js",
+  "browser": {
+    "./lib/e2ee.js": "./lib/e2ee-browser.js"
+  },
   "files": [
     "LICENSE",
     "index.js",
@@ -19,7 +22,7 @@
     "browserify": "^17.0.1"
   },
   "scripts": {
-    "test": "node test/client.test.js",
+    "test": "node test/client.test.js && node test/e2ee-browser.test.js",
     "browserify": "browserify web/web.js -o web/client/tyo-mq-client.js"
   },
   "repository": {
