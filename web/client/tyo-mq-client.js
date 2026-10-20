@@ -1,119 +1,202 @@
 (function(){function r(e,n,t){function o(i,f){if(!n[i]){if(!e[i]){var c="function"==typeof require&&require;if(!f&&c)return c(i,!0);if(u)return u(i,!0);var a=new Error("Cannot find module '"+i+"'");throw a.code="MODULE_NOT_FOUND",a}var p=n[i]={exports:{}};e[i][0].call(p.exports,function(r){var n=e[i][1][r];return o(n||r)},p,p.exports,r,e,n,t)}return n[i].exports}for(var u="function"==typeof require&&require,i=0;i<t.length;i++)o(t[i]);return o}return r})()({1:[function(require,module,exports){
-(function (Buffer){(function (){
 'use strict';
 
 /**
- * End-to-end encrypted payloads — reference implementation (see E2EE.md).
+ * End-to-end encrypted payloads — WebCrypto implementation of the SAME suite
+ * as lib/e2ee.js (`ecdh-es-p256-a256gcm`: ephemeral-static ECDH on P-256 →
+ * HKDF-SHA256 → AES-256-GCM), byte-for-byte wire-compatible: a payload sealed
+ * here opens in Node, and vice versa (pinned by test/e2ee-browser.test.js
+ * against tests/e2ee-vectors.json).
  *
- * Suite `ecdh-es-p256-a256gcm` (ECIES): ephemeral-static ECDH on P-256 →
- * HKDF-SHA256 → AES-256-GCM. Forward-secret per message; the sender needs only
- * the recipient's static public key. Broker-blind: only routing metadata and
- * ciphertext cross the wire.
+ * This file is what the browser bundle gets for `./e2ee` (package.json
+ * "browser" field): Node's crypto.hkdfSync / createECDH do not exist in the
+ * browserify shim, so the Node file silently cannot run in a browser.
  *
- * This is the byte-for-byte contract every tyo-mq client language implements;
- * conformance is pinned by tests/e2ee-vectors.json.
+ * Differences from the Node file, dictated by WebCrypto:
+ *   - EVERY function returns a Promise (subtle.* is async). publisher.produce
+ *     returns a Promise when it encrypts through this file; subscriber awaits
+ *     open() before handing plaintext to the app.
+ *   - A private key is a CryptoKey, a JWK ({kty:'EC', crv:'P-256', d, x, y}),
+ *     or a raw pair {privateKey: 32B scalar, publicKey: 65B point} — WebCrypto
+ *     cannot import a bare scalar without its public point. generateKeyPair()
+ *     returns {privateKey: <JWK>, publicKey: <Uint8Array 65B>}.
+ *   - open() resolves a Uint8Array; use decodeText() for UTF-8.
+ * No Buffer, no Node modules: runs on globalThis.crypto.subtle (browsers,
+ * and Node 20+ for tests).
  */
 
-const crypto = require('crypto');
+var ALG = 'ecdh-es-p256-a256gcm';
+var CURVE = 'P-256';
+var INFO_PREFIX = 'tyo-mq-e2ee-v1:';
+var TAG_BITS = 128;
+var IV_BYTES = 12;
 
-const ALG = 'ecdh-es-p256-a256gcm';
-const CURVE = 'prime256v1'; // NIST P-256 / secp256r1
-const INFO_PREFIX = 'tyo-mq-e2ee-v1:';
-const TAG_BYTES = 16; // AES-GCM tag, appended to the ciphertext (WebCrypto layout)
-const IV_BYTES = 12;
-
-function toBuf(x) {
-    if (Buffer.isBuffer(x)) return x;
-    if (x instanceof Uint8Array) return Buffer.from(x);
-    if (typeof x === 'string') return Buffer.from(x, 'base64');
-    return Buffer.from(x);
+function subtle() {
+    var c = (typeof globalThis !== 'undefined') ? globalThis.crypto : null;
+    if (!c || !c.subtle) throw new Error('e2ee: WebCrypto (crypto.subtle) is not available in this environment');
+    return c.subtle;
+}
+function randomBytes(n) {
+    var out = new Uint8Array(n);
+    globalThis.crypto.getRandomValues(out);
+    return out;
 }
 
-// aad binds a ciphertext to its cleartext routing so a sealed payload can't be
-// cut-and-pasted onto a different envelope. Bytes: event "\n" to "\n" from.
+// ── bytes / base64 helpers (no Buffer) ─────────────────────────────────────
+function utf8(str) { return new TextEncoder().encode(String(str)); }
+function decodeText(bytes) { return new TextDecoder().decode(toBytes(bytes)); }
+function b64decode(str) {
+    var bin = atob(String(str).replace(/-/g, '+').replace(/_/g, '/').replace(/\s/g, ''));
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+}
+function b64encode(bytes) {
+    var s = '';
+    bytes = toBytes(bytes);
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s);
+}
+function b64url(bytes) { return b64encode(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
+// Accepts Uint8Array, ArrayBuffer, Node Buffer (a Uint8Array subclass), or a
+// base64 string. Strings are BASE64 here (keys/ciphertext), never UTF-8 — use
+// utf8() for text.
+function toBytes(x) {
+    if (x instanceof Uint8Array) return new Uint8Array(x.buffer, x.byteOffset, x.byteLength);
+    if (x instanceof ArrayBuffer) return new Uint8Array(x);
+    if (typeof x === 'string') return b64decode(x);
+    if (x && typeof x.length === 'number') return Uint8Array.from(x);
+    throw new Error('e2ee: unsupported byte source');
+}
+function concat(a, b) {
+    var out = new Uint8Array(a.length + b.length);
+    out.set(a, 0); out.set(b, a.length);
+    return out;
+}
+
+// aad binds a ciphertext to its cleartext routing — identical bytes to the Node
+// implementation: event "\n" to "\n" from.
 function aad(event, to, from) {
-    return Buffer.from((event || '') + '\n' + (to || '') + '\n' + (from || ''), 'utf8');
+    return utf8((event || '') + '\n' + (to || '') + '\n' + (from || ''));
 }
 
-// deriveKey turns the ECDH shared X-coordinate into the AES key. HKDF-SHA256,
-// empty salt, info = "tyo-mq-e2ee-v1:<alg>:<kid>".
+// ── key import ─────────────────────────────────────────────────────────────
+function importPublic(raw) {
+    var bytes = toBytes(raw);
+    if (bytes.length !== 65 || bytes[0] !== 4) throw new Error('e2ee: expected a 65-byte uncompressed P-256 public point');
+    return subtle().importKey('raw', bytes, { name: 'ECDH', namedCurve: CURVE }, true, []);
+}
+function jwkFromRawPair(priv, pub) {
+    var d = toBytes(priv), p = toBytes(pub);
+    if (d.length !== 32) throw new Error('e2ee: expected a 32-byte P-256 private scalar');
+    if (p.length !== 65 || p[0] !== 4) throw new Error('e2ee: expected a 65-byte uncompressed P-256 public point');
+    return { kty: 'EC', crv: CURVE, d: b64url(d), x: b64url(p.subarray(1, 33)), y: b64url(p.subarray(33, 65)) };
+}
+function isCryptoKey(k) { return typeof CryptoKey !== 'undefined' && k instanceof CryptoKey; }
+// A private key: CryptoKey | JWK | {privateKey, publicKey}. Resolves {key, jwk|null}.
+function importPrivate(priv) {
+    if (isCryptoKey(priv)) return Promise.resolve({ key: priv, jwk: null });
+    var jwk;
+    if (priv && typeof priv === 'object' && priv.kty === 'EC') jwk = priv;
+    else if (priv && typeof priv === 'object' && priv.privateKey !== undefined && priv.publicKey !== undefined)
+        jwk = jwkFromRawPair(priv.privateKey, priv.publicKey);
+    else
+        throw new Error('e2ee (browser): a private key must be a CryptoKey, a JWK, or {privateKey, publicKey} — a bare scalar cannot be imported without its public point');
+    return subtle().importKey('jwk', jwk, { name: 'ECDH', namedCurve: CURVE }, false, ['deriveBits'])
+        .then(function (key) { return { key: key, jwk: jwk }; });
+}
+function rawPublicFromJwk(jwk) {
+    return concat(new Uint8Array([4]), concat(b64decode(jwk.x), b64decode(jwk.y)));
+}
+
+// ── KDF ────────────────────────────────────────────────────────────────────
+// HKDF-SHA256, empty salt, info = "tyo-mq-e2ee-v1:<alg>:<kid>" → AES-256-GCM key.
 function deriveKey(sharedX, kid) {
-    const info = Buffer.from(INFO_PREFIX + ALG + ':' + (kid || ''), 'utf8');
-    return Buffer.from(crypto.hkdfSync('sha256', toBuf(sharedX), Buffer.alloc(0), info, 32));
+    var info = utf8(INFO_PREFIX + ALG + ':' + (kid || ''));
+    var s = subtle();
+    return s.importKey('raw', toBytes(sharedX), 'HKDF', false, ['deriveBits'])
+        .then(function (k) { return s.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: info }, k, 256); })
+        .then(function (bits) { return s.importKey('raw', bits, 'AES-GCM', false, ['encrypt', 'decrypt']); });
+}
+function ecdh(privKey, pubKey) {
+    return subtle().deriveBits({ name: 'ECDH', public: pubKey }, privKey, 256).then(function (b) { return new Uint8Array(b); });
 }
 
-// seal encrypts plaintext to a recipient's static public key (65-byte
-// uncompressed P-256 point, Buffer or base64). Returns { enc, message } where
-// enc = {v,alg,epk,iv,kid} and message = base64(ciphertext||tag).
-// opts.ephemeralPriv / opts.iv make it deterministic for vector generation.
+// ── seal / open ────────────────────────────────────────────────────────────
+// seal(recipientPub, event, to, from, plaintext, opts) → Promise<{enc, message}>.
+// plaintext: Uint8Array | string (UTF-8). opts.ephemeralPriv ({privateKey,
+// publicKey} | JWK) and opts.iv make it deterministic for vector checks.
 function seal(recipientPub, event, to, from, plaintext, opts) {
     opts = opts || {};
-    const eph = crypto.createECDH(CURVE);
-    if (opts.ephemeralPriv) eph.setPrivateKey(toBuf(opts.ephemeralPriv));
-    else eph.generateKeys();
-    const epk = eph.getPublicKey(); // 65-byte uncompressed
-    const sharedX = eph.computeSecret(toBuf(recipientPub));
-    const kid = opts.kid || '';
-    const key = deriveKey(sharedX, kid);
-    const iv = opts.iv ? toBuf(opts.iv) : crypto.randomBytes(IV_BYTES);
-
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-    cipher.setAAD(aad(event, to, from));
-    const ct = Buffer.concat([cipher.update(toBuf2(plaintext)), cipher.final()]);
-    const box = Buffer.concat([ct, cipher.getAuthTag()]);
-
-    return {
-        enc: { v: 1, alg: ALG, epk: epk.toString('base64'), iv: iv.toString('base64'), kid: kid },
-        message: box.toString('base64'),
-    };
+    var s = subtle();
+    var pt = (typeof plaintext === 'string') ? utf8(plaintext) : toBytes(plaintext);
+    var kid = opts.kid || '';
+    var iv = opts.iv ? toBytes(opts.iv) : randomBytes(IV_BYTES);
+    var ephemeral = opts.ephemeralPriv
+        ? importPrivate(opts.ephemeralPriv).then(function (r) { return { priv: r.key, epk: rawPublicFromJwk(r.jwk) }; })
+        : s.generateKey({ name: 'ECDH', namedCurve: CURVE }, true, ['deriveBits']).then(function (pair) {
+            return s.exportKey('raw', pair.publicKey).then(function (raw) { return { priv: pair.privateKey, epk: new Uint8Array(raw) }; });
+        });
+    return Promise.all([ephemeral, importPublic(recipientPub)]).then(function (r) {
+        var eph = r[0], recipient = r[1];
+        return ecdh(eph.priv, recipient).then(function (sharedX) { return deriveKey(sharedX, kid); }).then(function (key) {
+            return s.encrypt({ name: 'AES-GCM', iv: iv, additionalData: aad(event, to, from), tagLength: TAG_BITS }, key, pt);
+        }).then(function (box) {
+            return {
+                enc: { v: 1, alg: ALG, epk: b64encode(eph.epk), iv: b64encode(iv), kid: kid },
+                message: b64encode(new Uint8Array(box)),
+            };
+        });
+    });
 }
 
-// open reverses seal with the recipient's private key (32-byte scalar, Buffer or
-// base64). Returns the plaintext Buffer; throws on a bad tag / AAD / key.
+// open(myPriv, enc, event, to, from, message) → Promise<Uint8Array>. Rejects on
+// a bad tag / AAD / key, or an unsupported alg.
 function open(myPriv, enc, event, to, from, message) {
-    if (!enc || enc.alg !== ALG) throw new Error('e2ee: unsupported alg ' + (enc && enc.alg));
-    const ecdh = crypto.createECDH(CURVE);
-    ecdh.setPrivateKey(toBuf(myPriv));
-    const sharedX = ecdh.computeSecret(Buffer.from(enc.epk, 'base64'));
-    const key = deriveKey(sharedX, enc.kid || '');
-
-    const box = Buffer.from(message, 'base64');
-    const ct = box.subarray(0, box.length - TAG_BYTES);
-    const tag = box.subarray(box.length - TAG_BYTES);
-
-    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(enc.iv, 'base64'));
-    decipher.setAAD(aad(event, to, from));
-    decipher.setAuthTag(tag);
-    return Buffer.concat([decipher.update(ct), decipher.final()]);
+    if (!enc || enc.alg !== ALG) return Promise.reject(new Error('e2ee: unsupported alg ' + (enc && enc.alg)));
+    var s = subtle();
+    return Promise.all([importPrivate(myPriv), importPublic(b64decode(enc.epk))]).then(function (r) {
+        return ecdh(r[0].key, r[1]);
+    }).then(function (sharedX) { return deriveKey(sharedX, enc.kid || ''); }).then(function (key) {
+        return s.decrypt({ name: 'AES-GCM', iv: b64decode(enc.iv), additionalData: aad(event, to, from), tagLength: TAG_BITS }, key, b64decode(message));
+    }).then(function (pt) { return new Uint8Array(pt); }, function (err) {
+        // WebCrypto reports a bad tag as a bare OperationError; name it.
+        throw new Error('e2ee: decrypt failed' + (err && err.message ? ' (' + err.message + ')' : ''));
+    });
 }
 
-// generateKeyPair returns a fresh P-256 keypair as raw Buffers
-// { privateKey (32B), publicKey (65B uncompressed) }.
+// generateKeyPair() → Promise<{privateKey: JWK, publicKey: Uint8Array(65)}>.
 function generateKeyPair() {
-    const e = crypto.createECDH(CURVE);
-    e.generateKeys();
-    return { privateKey: e.getPrivateKey(), publicKey: e.getPublicKey() };
+    var s = subtle();
+    return s.generateKey({ name: 'ECDH', namedCurve: CURVE }, true, ['deriveBits']).then(function (pair) {
+        return Promise.all([s.exportKey('jwk', pair.privateKey), s.exportKey('raw', pair.publicKey)]);
+    }).then(function (r) {
+        var jwk = r[0];
+        return { privateKey: { kty: 'EC', crv: CURVE, d: jwk.d, x: jwk.x, y: jwk.y }, publicKey: new Uint8Array(r[1]) };
+    });
 }
-
-// publicKeyFromPrivate derives the uncompressed public point from a raw scalar.
+// publicKeyFromPrivate(JWK | {privateKey, publicKey}) → Uint8Array(65). Sync.
 function publicKeyFromPrivate(priv) {
-    const e = crypto.createECDH(CURVE);
-    e.setPrivateKey(toBuf(priv));
-    return e.getPublicKey();
+    if (priv && priv.kty === 'EC') return rawPublicFromJwk(priv);
+    if (priv && priv.publicKey !== undefined) return toBytes(priv.publicKey);
+    throw new Error('e2ee (browser): cannot derive a public point from a bare scalar');
 }
 
-// plaintext may be a Buffer/Uint8Array or a string (treated as UTF-8, NOT base64).
-function toBuf2(x) {
-    if (Buffer.isBuffer(x)) return x;
-    if (x instanceof Uint8Array) return Buffer.from(x);
-    if (typeof x === 'string') return Buffer.from(x, 'utf8');
-    return Buffer.from(x);
+// isEnvelope: is this `enc` value THIS suite's envelope (something open() can
+// act on), as opposed to a bare `enc: true` flag or a foreign scheme's object?
+function isEnvelope(enc) {
+    return !!enc && typeof enc === 'object' && enc.alg === ALG
+        && typeof enc.epk === 'string' && typeof enc.iv === 'string';
 }
 
-module.exports = { ALG, CURVE, seal, open, deriveKey, aad, generateKeyPair, publicKeyFromPrivate };
+module.exports = {
+    ALG: ALG, CURVE: CURVE, async: true,
+    seal: seal, open: open, deriveKey: deriveKey, aad: aad,
+    generateKeyPair: generateKeyPair, publicKeyFromPrivate: publicKeyFromPrivate,
+    isEnvelope: isEnvelope, decodeText: decodeText,
+};
 
-}).call(this)}).call(this,require("buffer").Buffer)
-},{"buffer":55,"crypto":72}],2:[function(require,module,exports){
+},{}],2:[function(require,module,exports){
 /**
  * @file message-queue.js
  * 
@@ -419,7 +502,13 @@ function Publisher (name, event, options) {
      */
 
     this.sendIdentificationInfo = function () {
-        var payload = {name: name};
+        // producer.name, not the constructor arg: an anonymous producer mints
+        // ANONYMOUS-<uuid> (subscriber.js) and uses it as `from` on every
+        // PRODUCE, but used to register with `{name: undefined}` → `{}` → the
+        // broker refused the PRODUCER frame ("Incorrect producer's name") and the
+        // producer only ever existed through lazy registration on its first
+        // PRODUCE. Register under the name actually in use.
+        var payload = {name: producer.name};
         if (producer.default_ttl !== null && producer.default_ttl !== undefined)
             payload.default_ttl = producer.default_ttl;
         this.sendMessage.call(producer, 'PRODUCER', payload);
@@ -489,13 +578,28 @@ function Publisher (name, event, options) {
                 // opportunistic: fall through and send cleartext
             }
             else {
-                var plaintext = Buffer.from(JSON.stringify(message.message), 'utf8');
+                var plaintextJson = JSON.stringify(message.message);
+                var plaintext = (typeof Buffer !== 'undefined') ? Buffer.from(plaintextJson, 'utf8') : new TextEncoder().encode(plaintextJson);
                 var sealed = e2ee.seal(peer.publicKey, message.event, message.to || '', message.from, plaintext, { kid: peer.kid });
-                message.enc = sealed.enc;
-                message.message = sealed.message; // payload becomes the base64 ciphertext string
+                var applySealed = function (s) {
+                    message.enc = s.enc;
+                    message.message = s.message; // payload becomes the base64 ciphertext string
+                };
+                // The Node implementation seals synchronously; the WebCrypto one
+                // (browser bundle) returns a Promise — in which case produce()
+                // returns a Promise that resolves once the frame has been sent.
+                if (sealed && typeof sealed.then === 'function')
+                    return sealed.then(function (s) { applySealed(s); send(); });
+                applySealed(sealed);
             }
         }
 
+        send();
+        return;
+
+        // Serialise and emit (chunking large frames). Hoisted so the async
+        // encryption path above can call it after the Promise settles.
+        function send() {
         var str = JSON.stringify(message);
         var chunkSize = Publisher.CHUNK_SIZE;
 
@@ -515,6 +619,7 @@ function Publisher (name, event, options) {
                 total:      total,
                 data:       str.slice(i * chunkSize, (i + 1) * chunkSize)
             }, self.name);
+        }
         }
     };
 
@@ -609,7 +714,7 @@ util.inherits(Publisher, Subscriber);
 module.exports = Publisher;
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"./e2ee":1,"./subscriber":5,"buffer":55,"tyo-mq-protocol":273,"util":266}],4:[function(require,module,exports){
+},{"./e2ee":1,"./subscriber":5,"buffer":55,"tyo-mq-protocol":265,"util":270}],4:[function(require,module,exports){
 (function (process){(function (){
 /**
  * @file socket.js
@@ -989,7 +1094,7 @@ Socket.prototype.getId = Socket.prototype.getSocketId;
 module.exports = Socket;
 
 }).call(this)}).call(this,require('_process'))
-},{"_process":199,"socket.io-client":235,"tyo-mq-protocol":273}],5:[function(require,module,exports){
+},{"_process":199,"socket.io-client":235,"tyo-mq-protocol":265}],5:[function(require,module,exports){
 /**
  * @file subscriber.js
  */
@@ -1001,7 +1106,6 @@ const crypto      = require('crypto'),
       e2ee      = require('./e2ee');
 
 var Socket = require('./socket');
-const { constants } = require('buffer');
 
 /**
  * 
@@ -1015,7 +1119,11 @@ function Subscriber (name, options) {
     // When no name is supplied, mint a unique anonymous identity so two unnamed
     // producers/consumers never collide on the shared 'ANONYMOUS' name. The
     // ANONYMOUS- prefix keeps them recognisable to the server's realm policy.
-    this.name = name || (Constants.ANONYMOUS + '-' + crypto.randomUUID());
+    // WebCrypto's randomUUID in browsers (the browserify crypto shim has none);
+    // Node's crypto.randomUUID otherwise.
+    var uuid = (typeof globalThis !== 'undefined' && globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function')
+        ? globalThis.crypto.randomUUID() : crypto.randomUUID();
+    this.name = name || (Constants.ANONYMOUS + '-' + uuid);
     this.consumer_id = options.consumer_id || options.consumerId || this.name;
 
     var subscriber = this;
@@ -1090,7 +1198,7 @@ function Subscriber (name, options) {
             if (event)
                 eventStr = events.toEventString(event);
             else {
-                eventStr = constants.EVENT_ALL; // who + "-ALL";
+                eventStr = Constants.EVENT_ALL; // who + "-ALL";
                 scope = Constants.SCOPE_ALL;
                 scope_all = true;
             }
@@ -1138,25 +1246,53 @@ function Subscriber (name, options) {
             self.consumes[consumerEventStr] = function (obj) {
                 //var intendedEvent = obj.event;
     
-                // if the message is encrypted, then it needs to be decrypted first
+                // If the message was sealed with THIS client's generic E2EE suite, it
+                // must be decrypted first — and never handed over as ciphertext.
+                //
+                // `enc` carrying anything else is NOT ours to decrypt: an
+                // e2ee:required realm only checks that `enc` is present (it cannot
+                // verify encryption without being able to read it), so a client
+                // that does its own cryptography — the Hilia apps carry Signal
+                // ciphertext and set a bare `enc: true` — satisfies the realm that
+                // way. Such a payload is delivered to the application untouched,
+                // with `obj.enc` visible on the 4th callback argument. Dropping it
+                // (the old behaviour) made every such realm undeliverable here.
                 var message = obj.message;
-                if (obj.enc) {
+                if (obj.enc && e2ee.isEnvelope(obj.enc)) {
                     if (!self.e2ee || !self.e2ee.resolver || typeof self.e2ee.resolver.privateKey !== 'function') {
                         if (self.logger && self.logger.warn)
                             self.logger.warn('E2EE: received an encrypted message but no key resolver is configured — dropping');
                         return;
                     }
+                    var dropUndecryptable = function (err) {
+                        if (self.logger && self.logger.warn)
+                            self.logger.warn('E2EE: failed to decrypt message — dropping: ' + (err && err.message));
+                        // never hand ciphertext to the application handler
+                    };
+                    var opened;
                     try {
                         var priv = self.e2ee.resolver.privateKey(obj.enc.kid);
-                        var pt = e2ee.open(priv, obj.enc, obj.event, obj.to, obj.from, obj.message);
-                        message = JSON.parse(pt.toString('utf8'));
+                        // The Node implementation returns bytes synchronously; the
+                        // WebCrypto one (browser bundle) returns a Promise. Treat both
+                        // the same so delivery order within this event is preserved
+                        // either way (a later cleartext frame can overtake a sealed
+                        // one only in the browser, where decryption is inherently async).
+                        opened = Promise.resolve(e2ee.open(priv, obj.enc, obj.event, obj.to, obj.from, obj.message));
                     }
-                    catch (err) {
-                        if (self.logger && self.logger.warn)
-                            self.logger.warn('E2EE: failed to decrypt message — dropping: ' + err.message);
-                        return; // never hand ciphertext to the application handler
-                    }
+                    catch (err) { dropUndecryptable(err); return; }
+                    opened.then(function (pt) {
+                        var decoded;
+                        try { decoded = JSON.parse(e2ee.decodeText(pt)); }
+                        catch (err) { dropUndecryptable(err); return; }
+                        deliver(decoded);
+                    }, dropUndecryptable);
+                    return;
                 }
+                deliver(message);
+                return;
+
+                // Everything after decryption / pass-through (hoisted).
+                function deliver(message) {
     
                 var from = obj.from || message.from;
                 var msgId = obj.msgId || obj.msg_id;
@@ -1183,6 +1319,7 @@ function Subscriber (name, options) {
                         });
                     }
                 //}
+                }
             };
     
             var consumeEventStr = events.toConsumeEvent(consumerEventStr);
@@ -1381,7 +1518,14 @@ function Subscriber (name, options) {
      * forwards a UAK-gated sealed blob to a subscribed recipient as a
      * SEALED_MESSAGE event. The transport stays crypto-agnostic — set
      * `subscriber.onSealedMessage = function (blob, msgId) {...}` to hand the
-     * blob off to the E2EE core's handle_incoming_sealed. Wired inside
+     * blob off to the E2EE core's handle_incoming_sealed. The handler may be
+     * synchronous (throw = refuse the blob) or return a Promise (reject =
+     * refuse); during an ack-mode drain (sealedSubscribe) the broker attaches
+     * a per-message ack callback (`serverAck`) and the handler's outcome is
+     * reported back as {ok:true} / {ok:false, message} — {ok:false} routes
+     * the entry to the broker's dead-letter queue. When the server sends no
+     * ack callback (live delivery, legacy replay) behaviour is unchanged:
+     * the handler simply runs. Wired inside
      * addConnectionListener (rather than eagerly here) because self.socket
      * doesn't exist yet until the underlying connection is established; the
      * off()-before-on() guards against listener stacking across reconnects
@@ -1391,9 +1535,18 @@ function Subscriber (name, options) {
      */
     subscriber.addConnectionListener(function () {
         subscriber.socket.off('SEALED_MESSAGE');
-        subscriber.socket.on('SEALED_MESSAGE', function (payload) {
-            if (typeof subscriber.onSealedMessage === 'function')
-                subscriber.onSealedMessage(payload.blob, payload.msg_id);
+        subscriber.socket.on('SEALED_MESSAGE', function (payload, serverAck) {
+            var done = typeof serverAck === 'function' ? serverAck : function () {};
+            if (typeof subscriber.onSealedMessage !== 'function')
+                return done({ok: false, message: 'no sealed handler'});
+            try {
+                // Handler may be sync (throw = refuse) or return a Promise.
+                Promise.resolve(subscriber.onSealedMessage(payload.blob, payload.msg_id))
+                    .then(function () { done({ok: true}); },
+                          function (e) { done({ok: false, message: e && e.message}); });
+            } catch (e) {
+                done({ok: false, message: e && e.message});
+            }
         });
     });
 
@@ -1421,26 +1574,76 @@ util.inherits(Subscriber, Socket);
  * publishPrekeys (not the callback(value)-only shape of lookupKey/
  * takePrekeys, since these commands report success/failure via `ok` rather
  * than a found/not-found lookup).
+ *
+ * Never hangs: a dead/never-acking broker rejects after `timeoutMs`
+ * (default Subscriber.EMIT_ACK_TIMEOUT_MS), and a disconnect mid-wait
+ * rejects immediately (one-shot 'disconnect' listener, removed on settle).
+ * Uses socket.io-client >= 4.4's `socket.timeout(ms).emit` — note its ack
+ * callback shape is `(err, response)`, unlike plain emit's `(response)`.
+ * socket.io itself also fails timeout()-acks on disconnect (_clearAcks,
+ * >= 4.6) but only for packets already flushed to the wire; the explicit
+ * listener guarantees prompt rejection in every case. A settle guard makes
+ * the redundancy harmless.
+ *
+ * @param {string} event wire event (SEALED_*)
+ * @param {object} payload
+ * @param {function} [callback] err-first; omit for a Promise
+ * @param {number} [timeoutMs] per-call ack-timeout override — used by
+ *        sealedSubscribe(), whose ack-mode drain legitimately outlasts the
+ *        default (see EMIT_DRAIN_TIMEOUT_MS)
  */
-Subscriber.prototype._sealedEmit = function (event, payload, callback) {
+Subscriber.prototype._sealedEmit = function (event, payload, callback, timeoutMs) {
     var self = this;
+    var ms = timeoutMs || Subscriber.EMIT_ACK_TIMEOUT_MS;
+
+    function start(done) {
+        var settled = false;
+        function settle(err, response) {
+            if (settled) return;
+            settled = true;
+            self.socket.off('disconnect', onDisconnect);
+            done(err, response);
+        }
+        function onDisconnect() {
+            settle(new Error(event + ' failed: socket disconnected'));
+        }
+        self.socket.once('disconnect', onDisconnect);
+        self.socket.timeout(ms).emit(event, payload, function (err, response) {
+            if (err)
+                return settle(new Error(event + ' failed: ' + (err.message || ('no ack within ' + ms + 'ms'))));
+            if (!response || response.ok === false)
+                return settle(new Error((response && response.message) || (event + ' failed')));
+            settle(null, response);
+        });
+    }
 
     if (!callback)
         return new Promise(function (resolve, reject) {
-            self.socket.emit(event, payload, function (response) {
-                if (!response || response.ok === false)
-                    return reject(new Error((response && response.message) || (event + ' failed')));
-                resolve(response);
+            start(function (err, response) {
+                if (err) reject(err);
+                else resolve(response);
             });
         });
 
-    self.socket.emit(event, payload, function (response) {
-        if (!response || response.ok === false)
-            callback(new Error((response && response.message) || (event + ' failed')));
-        else
-            callback(null, response);
-    });
+    start(callback);
 };
+
+/**
+ * Default ack timeout (ms) for sealed command emits (_sealedEmit:
+ * SEALED_CERT_REQUEST / SEALED_UAK_SET / SEALED_DELIVER). A broker that
+ * never acks rejects the call after this long instead of hanging the caller
+ * forever. Overridable: `Subscriber.EMIT_ACK_TIMEOUT_MS = 30000`.
+ */
+Subscriber.EMIT_ACK_TIMEOUT_MS = 15000;
+
+/**
+ * Larger ack timeout (ms) for sealedSubscribe() drains. In ack mode the
+ * broker answers SEALED_SUBSCRIBE only after the whole batch settles — up
+ * to SEALED_REPLAY_BATCH sequential per-message client acks server-side —
+ * so a busy-but-alive drain can legitimately exceed EMIT_ACK_TIMEOUT_MS.
+ * Overridable the same way.
+ */
+Subscriber.EMIT_DRAIN_TIMEOUT_MS = 120000;
 
 /**
  * Request a Signal sealed-sender certificate for an identity this
@@ -1488,18 +1691,36 @@ Subscriber.prototype.sendSealed = function (toRealm, toIdentity, uakB64, blobB64
 
 /**
  * Drain any durably-queued sealed messages for an owned identity (queued by
- * sendSealed() while this identity was offline). Replayed entries arrive via
- * the SEALED_MESSAGE listener / onSealedMessage hook, not in the response.
+ * sendSealed() while this identity was offline), in guaranteed-once ack mode:
+ * the broker emits each entry with a per-message ack callback and deletes it
+ * only after this client's onSealedMessage handler succeeds. Semantics are
+ * at-least-once with client-side dedup (the Signal model) — a message the
+ * handler processed whose ack was lost is re-delivered on the next drain, so
+ * the E2EE core must treat a decrypt failure on a replayed entry as
+ * "already processed or poison" and throw, which dead-letters it. Replayed
+ * entries arrive via the SEALED_MESSAGE listener / onSealedMessage hook, not
+ * in the response.
  *
- * @returns Promise<{ok, replayed, more}> when no callback is given
+ * Response shape: {ok, replayed, dead, pending, more} — `replayed` were
+ * acked+deleted, `dead` were refused by the handler and dead-lettered,
+ * `pending` timed out unanswered and stay queued. Loop contract: callers
+ * should re-call sealedSubscribe() while `more` is true to fully drain the
+ * inbox (SEALED_REPLAY_BATCH entries per call).
+ *
+ * Uses EMIT_DRAIN_TIMEOUT_MS (not the default EMIT_ACK_TIMEOUT_MS) as its
+ * ack timeout: the broker responds only after the batch settles server-side
+ * (sequential per-message acks), so a healthy drain can take well over 15s.
+ *
+ * @returns Promise<{ok, replayed, dead, pending, more}> when no callback is given
  */
 Subscriber.prototype.sealedSubscribe = function (identity, callback) {
-    return this._sealedEmit('SEALED_SUBSCRIBE', { identity: identity }, callback);
+    return this._sealedEmit('SEALED_SUBSCRIBE', { identity: identity, ack: true }, callback,
+        Subscriber.EMIT_DRAIN_TIMEOUT_MS);
 };
 
 module.exports = Subscriber;
 
-},{"./e2ee":1,"./socket":4,"buffer":55,"crypto":72,"tyo-mq-protocol":273,"util":266}],6:[function(require,module,exports){
+},{"./e2ee":1,"./socket":4,"crypto":72,"tyo-mq-protocol":265,"util":270}],6:[function(require,module,exports){
 
 /**
  * Expose `Emitter`.
@@ -1751,7 +1972,7 @@ Entity.prototype.encode = function encode(data, enc, /* internal */ reporter) {
   return this._getEncoder(enc).encode(data, reporter);
 };
 
-},{"../asn1":7,"inherits":165,"vm":267}],9:[function(require,module,exports){
+},{"../asn1":7,"inherits":165,"vm":271}],9:[function(require,module,exports){
 var inherits = require('inherits');
 var Reporter = require('../base').Reporter;
 var Buffer = require('buffer').Buffer;
@@ -26260,7 +26481,7 @@ module.exports = function isTypedArray(value) {
 	return !!whichTypedArray(value);
 };
 
-},{"which-typed-array":268}],171:[function(require,module,exports){
+},{"which-typed-array":272}],171:[function(require,module,exports){
 var toString = {}.toString;
 
 module.exports = Array.isArray || function (arr) {
@@ -30321,7 +30542,7 @@ Writable.prototype._destroy = function (err, cb) {
   cb(err);
 };
 }).call(this)}).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {},require("timers").setImmediate)
-},{"./_stream_duplex":209,"./internal/streams/destroy":215,"./internal/streams/stream":216,"_process":199,"core-util-is":65,"inherits":165,"process-nextick-args":198,"safe-buffer":217,"timers":259,"util-deprecate":263}],214:[function(require,module,exports){
+},{"./_stream_duplex":209,"./internal/streams/destroy":215,"./internal/streams/stream":216,"_process":199,"core-util-is":65,"inherits":165,"process-nextick-args":198,"safe-buffer":217,"timers":259,"util-deprecate":267}],214:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -36675,7 +36896,7 @@ Writable.prototype._destroy = function (err, cb) {
   cb(err);
 };
 }).call(this)}).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"../errors":244,"./_stream_duplex":245,"./internal/streams/destroy":252,"./internal/streams/state":256,"./internal/streams/stream":257,"_process":199,"buffer":55,"inherits":165,"util-deprecate":263}],250:[function(require,module,exports){
+},{"../errors":244,"./_stream_duplex":245,"./internal/streams/destroy":252,"./internal/streams/state":256,"./internal/streams/stream":257,"_process":199,"buffer":55,"inherits":165,"util-deprecate":267}],250:[function(require,module,exports){
 (function (process){(function (){
 'use strict';
 
@@ -37537,9 +37758,244 @@ module.exports = function toBuffer(data, encoding) {
 	throw new TypeError('The "data" argument must be a string, an Array, a Buffer, a Uint8Array, or a DataView.');
 };
 
-},{"isarray":261,"safe-buffer":223,"typed-array-buffer":262}],261:[function(require,module,exports){
+},{"isarray":261,"safe-buffer":223,"typed-array-buffer":266}],261:[function(require,module,exports){
 arguments[4][171][0].apply(exports,arguments)
 },{"dup":171}],262:[function(require,module,exports){
+(function (Buffer){(function (){
+/**
+ * Signed manager actions for admin-only operations.
+ */
+
+'use strict';
+
+const crypto = require('crypto');
+
+function stableStringify(value) {
+    if (value === null || typeof value !== 'object')
+        return JSON.stringify(value);
+    if (Array.isArray(value))
+        // JSON serializes an undefined array element as null.
+        return '[' + value.map(function (item) {
+            var encoded = stableStringify(item);
+            return encoded === undefined ? 'null' : encoded;
+        }).join(',') + ']';
+
+    // JSON.stringify drops object keys whose value is undefined, and the wire
+    // carries the JSON form — so the signature base must drop them too, or a
+    // body with an undefined field signs one payload and transmits another.
+    return '{' + Object.keys(value).sort().filter(function (key) {
+        return value[key] !== undefined;
+    }).map(function (key) {
+        return JSON.stringify(key) + ':' + stableStringify(value[key]);
+    }).join(',') + '}';
+}
+
+function signatureBase(action, body, timestamp, nonce) {
+    return [
+        String(action || ''),
+        String(timestamp || ''),
+        String(nonce || ''),
+        stableStringify(body || {})
+    ].join('\n');
+}
+
+function signAdminAction(adminToken, action, body, timestamp, nonce) {
+    return crypto.createHmac('sha256', String(adminToken))
+        .update(signatureBase(action, body, timestamp, nonce))
+        .digest('hex');
+}
+
+function createAdminProof(adminToken, action, body, opts) {
+    opts = opts || {};
+    var timestamp = opts.timestamp || Date.now();
+    var nonce = opts.nonce || crypto.randomBytes(16).toString('hex');
+    return {
+        timestamp: timestamp,
+        nonce: nonce,
+        signature: signAdminAction(adminToken, action, body || {}, timestamp, nonce)
+    };
+}
+
+function signaturesEqual(a, b) {
+    var left = Buffer.from(String(a || ''), 'hex');
+    var right = Buffer.from(String(b || ''), 'hex');
+    return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function verifyAdminProof(adminToken, action, body, proof, opts) {
+    opts = opts || {};
+    if (!proof || !proof.timestamp || !proof.nonce || !proof.signature)
+        return false;
+
+    var maxAgeMs = opts.maxAgeMs || 5 * 60 * 1000;
+    var timestamp = Number(proof.timestamp);
+    if (!Number.isFinite(timestamp))
+        return false;
+    if (Math.abs(Date.now() - timestamp) > maxAgeMs)
+        return false;
+
+    var expected = signAdminAction(adminToken, action, body || {}, timestamp, proof.nonce);
+    return signaturesEqual(expected, proof.signature);
+}
+
+module.exports = {
+    createAdminProof: createAdminProof,
+    signAdminAction: signAdminAction,
+    stableStringify: stableStringify,
+    verifyAdminProof: verifyAdminProof
+};
+
+}).call(this)}).call(this,require("buffer").Buffer)
+},{"buffer":55,"crypto":72}],263:[function(require,module,exports){
+
+function Constants() {
+    this.ANONYMOUS = 'ANONYMOUS';
+    
+    this.EVENT_DEFAULT = 'tyo-mq-mt-default';
+    this.EVENT_ALL = 'TM-ALL';
+    
+    this.SYSTEM = 'TYO-MQ-SYSTEM';
+    this.ALL_PUBLISHERS = 'TYO-MQ-ALL';
+
+    this.SCOPE_ALL = "all";
+    this.SCOPE_DEFAULT = "default";
+    
+    this.DEFAULT_PORT = 17352;
+
+    // E2EE public-key directory caps (E2EE.md). A base64 uncompressed P-256
+    // point is ~88 chars — 4 KB leaves ample headroom for any future suite
+    // while keeping directory entries un-abusable as a memory sink.
+    this.E2EE_MAX_PUBLIC_KEY_LENGTH = 4096;
+    this.E2EE_MAX_KEY_ID_LENGTH = 128;
+    this.E2EE_MAX_KEYS_PER_IDENTITY = 8;
+
+    // Signal prekey directory (secure-chat): a client publishes a prekey bundle
+    // (identity key + signed prekey + a pool of one-time prekeys); a peer TAKEs
+    // it, consuming one one-time prekey. Cap the pool so it cannot grow without
+    // bound, and cap how many prekeys one PREKEY_PUBLISH may add at once.
+    this.PREKEY_POOL_MAX = 100;
+    this.PREKEY_PUBLISH_BATCH_MAX = 100;
+
+    // Sealed-sender broker: anonymous senders present a short-lived sender
+    // cert plus a per-recipient unidentified access key (UAK) instead of an
+    // authenticated identity.
+    this.SEALED_CERT_TTL_MS = 24 * 60 * 60 * 1000;   // sender cert validity (24h)
+    this.SEALED_UAK_LENGTH = 16;                     // bytes, matches core derive_uak
+    this.SEALED_MAX_BLOB_LENGTH = 65536;             // reject absurd sealed blobs (64 KiB)
+    this.SEALED_SENDS_PER_MIN = 60;                  // per-connection anon sealed-send budget
+    this.SEALED_REPLAY_BATCH = 100;                  // max sealed messages drained per SEALED_SUBSCRIBE
+}
+
+var constants = constants || new Constants();
+
+module.exports = constants;
+},{}],264:[function(require,module,exports){
+/**
+ * @file events.js
+ */
+
+const constants = require( "./constants");
+
+function Events () {
+
+}
+
+/**
+ * Normailise event string
+ */
+
+Events.prototype.toEventString = function (event, prefix, suffix) {
+    var eventStr;
+    if (typeof event === 'string') {
+        eventStr = event;
+    }
+    else if (typeof event === 'object' && event.event) {
+        eventStr = event.event;
+    }
+    else 
+        throw new Error ('Unknown event object: should be a string or object with event string');
+    return (prefix ? (prefix + '-') : '') + eventStr + (suffix ? ('-' + suffix) : '');
+};
+
+/**
+ * This is different to the consume event
+ * this is the event name that the consumer socker will listen to
+ */
+
+Events.prototype.toConsumerEvent = function (event, producer, scope_all) {
+    if (scope_all)
+        this.toEventString(event, producer.toLowerCase());
+    return this.toEventString(event, producer).toLowerCase();
+}
+
+/**
+ * To Consume Event
+ */
+
+Events.prototype.toConsumeEvent = function (event) {
+    /**
+     * COSUMER EVENT = "CONSUME" + Lower(event)
+     * System event or defined Event are all capitalized
+     */
+    //var capEvent = event.toUpperCase();
+    return this.toEventString(event, 'CONSUME');
+};
+
+/**
+ * 
+ */
+
+Events.prototype.toOnDisconnectEvent = function (id) {
+    return 'DISCONNECT-' + id;
+};
+
+/**
+ * 
+ */
+
+Events.prototype.toOnConnectEvent = function (id) {
+    return 'CONNECT-' + id;
+}
+
+/**
+ * 
+ */
+
+Events.prototype.toOnUnsubscribeEvent =function  (event, id) {
+    // var eventStr = this.toEventString(event);
+    // return 'UNSUBSCRIBE-' + eventStr + '-' + id;
+    return this.toEventString(event, 'UNSUBSCRIBE', id);
+};
+
+/**
+ * 
+ */
+Events.prototype.toOnSubscribeEvent = function (id) {
+    return 'SUBSCRIBE-TO' + ((id) ? "-" + id : "");
+};
+
+Events.prototype.toConsumeEventAll = function (producer) {
+    // return 'CONSUME-' + producer + "-ALL";
+    return this.toEventString('CONSUME', this.toConsumerEventAll(producer));
+};
+
+Events.prototype.toConsumerEventAll = function (producer) {
+    // return 'producer + "-ALL";
+    return this.toEventString(producer.toLowerCase(), null, constants.EVENT_ALL);
+};
+
+var events = events || new Events();
+module.exports = events;
+},{"./constants":263}],265:[function(require,module,exports){
+'use strict';
+
+module.exports = {
+    constants: require('./constants'),
+    events: require('./events'),
+    adminSignature: require('./admin-signature'),
+};
+
+},{"./admin-signature":262,"./constants":263,"./events":264}],266:[function(require,module,exports){
 'use strict';
 
 var $TypeError = require('es-errors/type');
@@ -37560,7 +38016,7 @@ module.exports = $typedArrayBuffer || function typedArrayBuffer(x) {
 	return x.buffer;
 };
 
-},{"call-bound":63,"es-errors/type":130,"is-typed-array":170}],263:[function(require,module,exports){
+},{"call-bound":63,"es-errors/type":130,"is-typed-array":170}],267:[function(require,module,exports){
 (function (global){(function (){
 
 /**
@@ -37631,14 +38087,14 @@ function config (name) {
 }
 
 }).call(this)}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],264:[function(require,module,exports){
+},{}],268:[function(require,module,exports){
 module.exports = function isBuffer(arg) {
   return arg && typeof arg === 'object'
     && typeof arg.copy === 'function'
     && typeof arg.fill === 'function'
     && typeof arg.readUInt8 === 'function';
 }
-},{}],265:[function(require,module,exports){
+},{}],269:[function(require,module,exports){
 // Currently in sync with Node.js lib/internal/util/types.js
 // https://github.com/nodejs/node/commit/112cc7c27551254aa2b17098fb774867f05ed0d9
 
@@ -37974,7 +38430,7 @@ exports.isAnyArrayBuffer = isAnyArrayBuffer;
   });
 });
 
-},{"is-arguments":166,"is-generator-function":168,"is-typed-array":170,"which-typed-array":268}],266:[function(require,module,exports){
+},{"is-arguments":166,"is-generator-function":168,"is-typed-array":170,"which-typed-array":272}],270:[function(require,module,exports){
 (function (process){(function (){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -38693,7 +39149,7 @@ function callbackify(original) {
 exports.callbackify = callbackify;
 
 }).call(this)}).call(this,require('_process'))
-},{"./support/isBuffer":264,"./support/types":265,"_process":199,"inherits":165}],267:[function(require,module,exports){
+},{"./support/isBuffer":268,"./support/types":269,"_process":199,"inherits":165}],271:[function(require,module,exports){
 var indexOf = function (xs, item) {
     if (xs.indexOf) return xs.indexOf(item);
     else for (var i = 0; i < xs.length; i++) {
@@ -38844,7 +39300,7 @@ exports.createContext = Script.createContext = function (context) {
     return copy;
 };
 
-},{}],268:[function(require,module,exports){
+},{}],272:[function(require,module,exports){
 (function (global){(function (){
 'use strict';
 
@@ -38983,7 +39439,7 @@ module.exports = function whichTypedArray(value) {
 };
 
 }).call(this)}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"available-typed-arrays":22,"call-bind":62,"call-bound":63,"for-each":135,"get-proto":142,"gopd":144,"has-tostringtag/shams":148}],269:[function(require,module,exports){
+},{"available-typed-arrays":22,"call-bind":62,"call-bound":63,"for-each":135,"get-proto":142,"gopd":144,"has-tostringtag/shams":148}],273:[function(require,module,exports){
 var Factory = require('../lib/factory');
 var Producer = require('../lib/publisher');
 var Consumer = require('../lib/subscriber');
@@ -38998,239 +39454,4 @@ var mq = {
 };
 
 window.mq = mq;
-},{"../lib/factory":2,"../lib/publisher":3,"../lib/subscriber":5}],270:[function(require,module,exports){
-(function (Buffer){(function (){
-/**
- * Signed manager actions for admin-only operations.
- */
-
-'use strict';
-
-const crypto = require('crypto');
-
-function stableStringify(value) {
-    if (value === null || typeof value !== 'object')
-        return JSON.stringify(value);
-    if (Array.isArray(value))
-        // JSON serializes an undefined array element as null.
-        return '[' + value.map(function (item) {
-            var encoded = stableStringify(item);
-            return encoded === undefined ? 'null' : encoded;
-        }).join(',') + ']';
-
-    // JSON.stringify drops object keys whose value is undefined, and the wire
-    // carries the JSON form — so the signature base must drop them too, or a
-    // body with an undefined field signs one payload and transmits another.
-    return '{' + Object.keys(value).sort().filter(function (key) {
-        return value[key] !== undefined;
-    }).map(function (key) {
-        return JSON.stringify(key) + ':' + stableStringify(value[key]);
-    }).join(',') + '}';
-}
-
-function signatureBase(action, body, timestamp, nonce) {
-    return [
-        String(action || ''),
-        String(timestamp || ''),
-        String(nonce || ''),
-        stableStringify(body || {})
-    ].join('\n');
-}
-
-function signAdminAction(adminToken, action, body, timestamp, nonce) {
-    return crypto.createHmac('sha256', String(adminToken))
-        .update(signatureBase(action, body, timestamp, nonce))
-        .digest('hex');
-}
-
-function createAdminProof(adminToken, action, body, opts) {
-    opts = opts || {};
-    var timestamp = opts.timestamp || Date.now();
-    var nonce = opts.nonce || crypto.randomBytes(16).toString('hex');
-    return {
-        timestamp: timestamp,
-        nonce: nonce,
-        signature: signAdminAction(adminToken, action, body || {}, timestamp, nonce)
-    };
-}
-
-function signaturesEqual(a, b) {
-    var left = Buffer.from(String(a || ''), 'hex');
-    var right = Buffer.from(String(b || ''), 'hex');
-    return left.length === right.length && crypto.timingSafeEqual(left, right);
-}
-
-function verifyAdminProof(adminToken, action, body, proof, opts) {
-    opts = opts || {};
-    if (!proof || !proof.timestamp || !proof.nonce || !proof.signature)
-        return false;
-
-    var maxAgeMs = opts.maxAgeMs || 5 * 60 * 1000;
-    var timestamp = Number(proof.timestamp);
-    if (!Number.isFinite(timestamp))
-        return false;
-    if (Math.abs(Date.now() - timestamp) > maxAgeMs)
-        return false;
-
-    var expected = signAdminAction(adminToken, action, body || {}, timestamp, proof.nonce);
-    return signaturesEqual(expected, proof.signature);
-}
-
-module.exports = {
-    createAdminProof: createAdminProof,
-    signAdminAction: signAdminAction,
-    stableStringify: stableStringify,
-    verifyAdminProof: verifyAdminProof
-};
-
-}).call(this)}).call(this,require("buffer").Buffer)
-},{"buffer":55,"crypto":72}],271:[function(require,module,exports){
-
-function Constants() {
-    this.ANONYMOUS = 'ANONYMOUS';
-    
-    this.EVENT_DEFAULT = 'tyo-mq-mt-default';
-    this.EVENT_ALL = 'TM-ALL';
-    
-    this.SYSTEM = 'TYO-MQ-SYSTEM';
-    this.ALL_PUBLISHERS = 'TYO-MQ-ALL';
-
-    this.SCOPE_ALL = "all";
-    this.SCOPE_DEFAULT = "default";
-    
-    this.DEFAULT_PORT = 17352;
-
-    // E2EE public-key directory caps (E2EE.md). A base64 uncompressed P-256
-    // point is ~88 chars — 4 KB leaves ample headroom for any future suite
-    // while keeping directory entries un-abusable as a memory sink.
-    this.E2EE_MAX_PUBLIC_KEY_LENGTH = 4096;
-    this.E2EE_MAX_KEY_ID_LENGTH = 128;
-    this.E2EE_MAX_KEYS_PER_IDENTITY = 8;
-
-    // Signal prekey directory (secure-chat): a client publishes a prekey bundle
-    // (identity key + signed prekey + a pool of one-time prekeys); a peer TAKEs
-    // it, consuming one one-time prekey. Cap the pool so it cannot grow without
-    // bound, and cap how many prekeys one PREKEY_PUBLISH may add at once.
-    this.PREKEY_POOL_MAX = 100;
-    this.PREKEY_PUBLISH_BATCH_MAX = 100;
-
-    // Sealed-sender broker: anonymous senders present a short-lived sender
-    // cert plus a per-recipient unidentified access key (UAK) instead of an
-    // authenticated identity.
-    this.SEALED_CERT_TTL_MS = 24 * 60 * 60 * 1000;   // sender cert validity (24h)
-    this.SEALED_UAK_LENGTH = 16;                     // bytes, matches core derive_uak
-    this.SEALED_MAX_BLOB_LENGTH = 65536;             // reject absurd sealed blobs (64 KiB)
-    this.SEALED_SENDS_PER_MIN = 60;                  // per-connection anon sealed-send budget
-    this.SEALED_REPLAY_BATCH = 100;                  // max sealed messages drained per SEALED_SUBSCRIBE
-}
-
-var constants = constants || new Constants();
-
-module.exports = constants;
-},{}],272:[function(require,module,exports){
-/**
- * @file events.js
- */
-
-const constants = require( "./constants");
-
-function Events () {
-
-}
-
-/**
- * Normailise event string
- */
-
-Events.prototype.toEventString = function (event, prefix, suffix) {
-    var eventStr;
-    if (typeof event === 'string') {
-        eventStr = event;
-    }
-    else if (typeof event === 'object' && event.event) {
-        eventStr = event.event;
-    }
-    else 
-        throw new Error ('Unknown event object: should be a string or object with event string');
-    return (prefix ? (prefix + '-') : '') + eventStr + (suffix ? ('-' + suffix) : '');
-};
-
-/**
- * This is different to the consume event
- * this is the event name that the consumer socker will listen to
- */
-
-Events.prototype.toConsumerEvent = function (event, producer, scope_all) {
-    if (scope_all)
-        this.toEventString(event, producer.toLowerCase());
-    return this.toEventString(event, producer).toLowerCase();
-}
-
-/**
- * To Consume Event
- */
-
-Events.prototype.toConsumeEvent = function (event) {
-    /**
-     * COSUMER EVENT = "CONSUME" + Lower(event)
-     * System event or defined Event are all capitalized
-     */
-    //var capEvent = event.toUpperCase();
-    return this.toEventString(event, 'CONSUME');
-};
-
-/**
- * 
- */
-
-Events.prototype.toOnDisconnectEvent = function (id) {
-    return 'DISCONNECT-' + id;
-};
-
-/**
- * 
- */
-
-Events.prototype.toOnConnectEvent = function (id) {
-    return 'CONNECT-' + id;
-}
-
-/**
- * 
- */
-
-Events.prototype.toOnUnsubscribeEvent =function  (event, id) {
-    // var eventStr = this.toEventString(event);
-    // return 'UNSUBSCRIBE-' + eventStr + '-' + id;
-    return this.toEventString(event, 'UNSUBSCRIBE', id);
-};
-
-/**
- * 
- */
-Events.prototype.toOnSubscribeEvent = function (id) {
-    return 'SUBSCRIBE-TO' + ((id) ? "-" + id : "");
-};
-
-Events.prototype.toConsumeEventAll = function (producer) {
-    // return 'CONSUME-' + producer + "-ALL";
-    return this.toEventString('CONSUME', this.toConsumerEventAll(producer));
-};
-
-Events.prototype.toConsumerEventAll = function (producer) {
-    // return 'producer + "-ALL";
-    return this.toEventString(producer.toLowerCase(), null, constants.EVENT_ALL);
-};
-
-var events = events || new Events();
-module.exports = events;
-},{"./constants":271}],273:[function(require,module,exports){
-'use strict';
-
-module.exports = {
-    constants: require('./constants'),
-    events: require('./events'),
-    adminSignature: require('./admin-signature'),
-};
-
-},{"./admin-signature":270,"./constants":271,"./events":272}]},{},[269]);
+},{"../lib/factory":2,"../lib/publisher":3,"../lib/subscriber":5}]},{},[273]);
