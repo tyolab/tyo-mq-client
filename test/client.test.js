@@ -171,8 +171,10 @@ test('subscriber.subscribe() emits SUBSCRIBE and registers the exact CONSUME-* l
 // producer) is exactly the caller that takes that path, so it exercises the
 // previously-broken line end to end.
 test('subscriber.unsubscribe() undoes all three halves of subscribe(): broker UNSUBSCRIBE (object form, acked), local CONSUME-* handler, and the reconnect re-send', () => {
-    const sub = new Subscriber({ name: 'un-c', logger: quietLogger });
-    sub.connect();
+    const factory = new Factory({ logger: quietLogger });
+    let sub;
+    factory.createConsumer('un-c', function (c) { sub = c; });
+    lastSocket()._simulateConnect();
     const sock = lastSocket();
     sock.connected = true;
 
