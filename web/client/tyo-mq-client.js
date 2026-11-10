@@ -589,37 +589,42 @@ function Publisher (name, event, options) {
                 // (browser bundle) returns a Promise — in which case produce()
                 // returns a Promise that resolves once the frame has been sent.
                 if (sealed && typeof sealed.then === 'function')
-                    return sealed.then(function (s) { applySealed(s); send(); });
+                    return sealed.then(function (s) { applySealed(s); return send(); });
                 applySealed(sealed);
             }
         }
 
-        send();
-        return;
+        return send();
 
         // Serialise and emit (chunking large frames). Hoisted so the async
         // encryption path above can call it after the Promise settles.
+        // Returns true when the frame (every chunk) was handed to socket.io,
+        // false when the producer socket is not connected and the frame was
+        // DROPPED — a PRODUCE on a down socket used to vanish without a trace,
+        // and the producer's socket is separate from any consumer's, so a
+        // healthy consumer says nothing about whether this producer can send.
         function send() {
         var str = JSON.stringify(message);
         var chunkSize = Publisher.CHUNK_SIZE;
 
-        if (str.length <= chunkSize) {
-            self.sendMessage.call(self, 'PRODUCE', message, self.name);
-            return;
-        }
+        if (str.length <= chunkSize)
+            return self.sendMessage.call(self, 'PRODUCE', message, self.name);
 
         // Large message — split into chunks
         var total = Math.ceil(str.length / chunkSize);
         var transferId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
 
+        var allSent = true;
         for (var i = 0; i < total; i++) {
-            self.sendMessage.call(self, 'PRODUCE_CHUNK', {
+            if (self.sendMessage.call(self, 'PRODUCE_CHUNK', {
                 transferId: transferId,
                 index:      i,
                 total:      total,
                 data:       str.slice(i * chunkSize, (i + 1) * chunkSize)
-            }, self.name);
+            }, self.name) === false)
+                allSent = false;
         }
+        return allSent;
         }
     };
 
@@ -1065,13 +1070,17 @@ Socket.prototype.sendMessage = function (event, msg, from, callback) {
         
         if (callback && typeof callback === 'function')
             callback(new Error("Socket is created but not connected"));
-        return;
+        // Returned so a caller WITHOUT a callback (produce()) can still tell
+        // "sent" from "dropped": a frame emitted on a disconnected socket
+        // used to vanish with only a logger warning as its trace.
+        return false;
     }
     
     this.socket.emit(event, msg);
     if (callback && typeof callback === 'function') {
         callback();
     }
+    return true;
 };
 
 /**

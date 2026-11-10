@@ -124,6 +124,22 @@ test('publisher.produce() emits a PRODUCE frame with the event/message/from wire
     assert.strictEqual(produceCall.payload.from, 'pub-wire-test');
 });
 
+test('publisher.produce() returns true when the frame was emitted and false when the producer socket is down (nothing on the wire)', () => {
+    const factory = new Factory({ logger: quietLogger });
+    let producer;
+    factory.createProducer('ret-p', function (p) { producer = p; });
+    lastSocket()._simulateConnect();
+    const sock = lastSocket();
+    sock.connected = true;
+
+    assert.strictEqual(producer.produce('tick', { n: 1 }), true);
+    assert.strictEqual(sock.emits.filter(e => e.event === 'PRODUCE').length, 1);
+
+    sock.connected = false;
+    assert.strictEqual(producer.produce('tick', { n: 2 }), false, 'a dropped frame is reported, not silently lost');
+    assert.strictEqual(sock.emits.filter(e => e.event === 'PRODUCE').length, 1, 'nothing was emitted on the down socket');
+});
+
 test('subscriber.subscribe() emits SUBSCRIBE and registers the exact CONSUME-* listener tyo-mq-protocol computes, and inbound messages reach the handler', () => {
     const factory = new Factory({ logger: quietLogger });
     let consumer;
