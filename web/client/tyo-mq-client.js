@@ -771,6 +771,19 @@ function Socket() {
         this.onConnectListeners.push(listener);
     };
 
+    /**
+     * Remove a listener added with addConnectionListener — used by
+     * Subscriber.unsubscribe so an ended subscription is not re-sent to the
+     * broker on the next reconnect.
+     */
+    this.removeConnectionListener = function (listener) {
+        if (!this.onConnectListeners)
+            return;
+        var i = this.onConnectListeners.indexOf(listener);
+        if (i >= 0)
+            this.onConnectListeners.splice(i, 1);
+    };
+
     var self = this;
     this.onDisconnectListener = function(socket) {
         self.connected = false;
@@ -1338,6 +1351,22 @@ function Subscriber (name, options) {
 
         if (reSubscribe)
             self.addConnectionListener(resubscribeListener);
+
+        // Remember what unsubscribe() must undo: the on-connect re-send
+        // runnable and the exact wire parameters the broker keyed this
+        // subscription by. Keyed by the same consumer-event string as
+        // self.consumes, so the two maps always agree.
+        self._subscriptionRecords = self._subscriptionRecords || {};
+        {
+            var recordKey = events.toConsumerEvent(
+                event ? events.toEventString(event) : Constants.EVENT_ALL, who, !event);
+            self._subscriptionRecords[recordKey] = {
+                event: event ? events.toEventString(event) : Constants.EVENT_ALL,
+                producer: who,
+                scope: event ? undefined : Constants.SCOPE_ALL,
+                resubscribe: reSubscribe ? resubscribeListener : null
+            };
+        }
      }
 
     /**
@@ -1365,11 +1394,55 @@ function Subscriber (name, options) {
         this.subscribe(context, Constants.ALL_PUBLISHERS, event, onConsumeCallback);
     }
 
-    this.unsubscribe = function (event, who) {
-        var eventStr = events.toConsumerEvent(event, who);
-        // this.sendMessage('UNSUBSCRIBE', {event:eventStr});
-        this.off(eventStr);
-    }
+    /**
+     * Unsubscribe from an event of a producer — the inverse of subscribe().
+     *
+     * Undoes all three things subscribe() set up: the local CONSUME-* handler,
+     * the on-connect re-send (so the dead topic is NOT re-subscribed on the
+     * next reconnect), and the broker-side subscription, via the object-form
+     * UNSUBSCRIBE that mirrors SUBSCRIBE (broker >= 1.5.0; older brokers
+     * ignore it harmlessly). The optional callback receives the broker's ack:
+     * {ok:true, removed, event} or {ok:false, reason}; an Error when the
+     * socket is not connected.
+     *
+     * Before 0.2.2 this only removed a local listener (under a name that was
+     * never registered) and the broker send was commented out, so every
+     * ended subscription stayed registered on the broker.
+     */
+    this.unsubscribe = function (event, who, callback) {
+        var self = this;
+        if (typeof who === 'function') { callback = who; who = undefined; }
+        if (typeof event === 'function') { callback = event; event = undefined; }
+        who = who || Constants.ALL_PUBLISHERS;
+
+        var eventStr = event ? events.toEventString(event) : Constants.EVENT_ALL;
+        var consumerEventStr = events.toConsumerEvent(eventStr, who, !event);
+        var record = (self._subscriptionRecords || {})[consumerEventStr];
+
+        // 1) local delivery handler
+        self.off(events.toConsumeEvent(consumerEventStr));
+        if (self.consumes)
+            delete self.consumes[consumerEventStr];
+        // 2) reconnect re-send
+        if (record && record.resubscribe)
+            self.removeConnectionListener(record.resubscribe);
+        if (self._subscriptionRecords)
+            delete self._subscriptionRecords[consumerEventStr];
+        // 3) broker-side entry
+        var payload = {
+            event: eventStr,
+            producer: who,
+            consumer: self.name,
+            scope: event ? undefined : Constants.SCOPE_ALL
+        };
+        if (!self.socket || !self.socket.connected) {
+            if (callback) callback(new Error('Socket is created but not connected'));
+            return;
+        }
+        self.socket.emit('UNSUBSCRIBE', payload, function (response) {
+            if (callback) callback(null, response);
+        });
+    };
 
     this.unsubscribeAll = function () {
         this.socket.removeAllListeners();

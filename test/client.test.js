@@ -170,6 +170,47 @@ test('subscriber.subscribe() emits SUBSCRIBE and registers the exact CONSUME-* l
 // two-arg subscribe(who, callback) form (subscribe to *everything* from a
 // producer) is exactly the caller that takes that path, so it exercises the
 // previously-broken line end to end.
+test('subscriber.unsubscribe() undoes all three halves of subscribe(): broker UNSUBSCRIBE (object form, acked), local CONSUME-* handler, and the reconnect re-send', () => {
+    const sub = new Subscriber({ name: 'un-c', logger: quietLogger });
+    sub.connect();
+    const sock = lastSocket();
+    sock.connected = true;
+
+    const before = (sub.onConnectListeners || []).length;
+    sub.subscribe('weather-station', 'temperature', function () {});
+    const consumerEventStr = protocolEvents.toConsumerEvent('temperature', 'weather-station');
+    const consumeEventStr = protocolEvents.toConsumeEvent(consumerEventStr);
+    assert.strictEqual(sock.listeners(consumeEventStr).length, 1, 'subscribe registered the CONSUME-* handler');
+    assert.strictEqual((sub.onConnectListeners || []).length, before + 1, 'subscribe registered a reconnect re-send');
+    assert.ok(sock.emits.some(e => e.event === 'SUBSCRIBE'), 'SUBSCRIBE went to the broker');
+
+    let acked = null;
+    sub.unsubscribe('temperature', 'weather-station', (err, res) => { acked = { err, res }; });
+
+    const frame = sock.emits.filter(e => e.event === 'UNSUBSCRIBE').pop();
+    assert.ok(frame, 'UNSUBSCRIBE went to the broker');
+    assert.deepStrictEqual(
+        { event: frame.payload.event, producer: frame.payload.producer, consumer: frame.payload.consumer },
+        { event: 'temperature', producer: 'weather-station', consumer: 'un-c' },
+        'object form mirroring SUBSCRIBE — the client never computes the broker-internal event string');
+    assert.strictEqual(frame.payload.scope, undefined, 'default scope is omitted, as SUBSCRIBE omits it');
+    assert.strictEqual(sock.listeners(consumeEventStr).length, 0, 'the CONSUME-* handler is gone');
+    assert.strictEqual(sub.consumes[consumerEventStr], undefined, 'the consumes record is gone');
+    assert.strictEqual((sub.onConnectListeners || []).length, before, 'the reconnect re-send is gone — the dead topic will not be re-subscribed');
+
+    frame.ack({ ok: true, removed: 1, event: 'weather-station-temperature' });
+    assert.strictEqual(acked.err, null);
+    assert.strictEqual(acked.res.ok, true);
+
+    // Not connected: the broker half fails fast with an Error, the local halves still happen.
+    sub.subscribe('weather-station', 'humidity', function () {});
+    sock.connected = false;
+    let offline = null;
+    sub.unsubscribe('humidity', 'weather-station', (err) => { offline = err; });
+    assert.ok(offline instanceof Error);
+    assert.strictEqual(sock.listeners(protocolEvents.toConsumeEvent(protocolEvents.toConsumerEvent('humidity', 'weather-station'))).length, 0);
+});
+
 test('subscriber.subscribe(who, callback) with no event name uses EVENT_ALL/ALL scope (regression: buffer.constants shadowing)', () => {
     const factory = new Factory({ logger: quietLogger });
     let consumer;
